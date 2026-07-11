@@ -1,0 +1,11 @@
+{
+  "name": "whatsapp-readapi",
+  "version": "1.0.0",
+  "description": "Read-only HTTP query API over the whatsmeow bridge messages.db (cloud-queryable WhatsApp)",
+  "type": "module",
+  "private": true,
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  }
+}
