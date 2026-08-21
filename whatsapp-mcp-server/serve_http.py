@@ -58,7 +58,17 @@ CODE_TTL = 300               # 5m
 REDIRECT_ALLOWLIST = {
     "https://claude.ai/api/mcp/auth_callback",
     "https://claude.com/api/mcp/auth_callback",
+    # ChatGPT's legacy connector callback (still used by published apps).
+    "https://chatgpt.com/connector_platform_oauth_redirect",
 }
+# ChatGPT mints a FRESH callback path per connector
+# (https://chatgpt.com/connector/oauth/<callback_id>), so it can never match an
+# exact-string allowlist. Allow a narrow path prefix on the ChatGPT host instead;
+# the consent password still gates every authorization regardless of redirect.
+_REDIRECT_HOSTS = {"chatgpt.com"}
+_REDIRECT_PATH_PREFIXES = ("/connector/oauth/", "/aip/")
+# Desktop/native clients get a loopback callback on an ephemeral port (RFC 8252).
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
 HOST = os.environ.get("MCP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("MCP_PORT", "8085"))
@@ -69,7 +79,8 @@ import hmac
 import json
 import secrets
 import time
-from urllib.parse import parse_qs
+import html
+from urllib.parse import parse_qs, quote, urlparse
 
 import uvicorn
 from starlette.requests import Request
@@ -83,6 +94,9 @@ WRITE_TOOLS = ["send_message", "send_file", "send_audio_message", "download_medi
 for name in WRITE_TOOLS:
     main.mcp._tool_manager._tools.pop(name, None)
 print("read-only MCP tools:", sorted(main.mcp._tool_manager._tools.keys()), flush=True)
+
+# --- allowlisted send: one narrow write tool, group JIDs from allowlist.json ---
+import mentee_send  # registers send_to_mentee_group + list_mentee_groups
 
 # --- compat shim: upstream tools return dataclasses; mcp>=1.10 wants dicts ---
 import dataclasses
@@ -175,10 +189,39 @@ def _pkce_ok(verifier: str, challenge: str) -> bool:
     return hmac.compare_digest(_b64u(digest), challenge)
 
 
-def _issue_tokens(scope: str):
+def _redirect_ok(uri: str) -> bool:
+    """Exact allowlist, plus a narrow per-connector prefix for ChatGPT."""
+    if uri in REDIRECT_ALLOWLIST:
+        return True
+    try:
+        u = urlparse(uri)
+    except Exception:
+        return False
+    if u.fragment or "@" in u.netloc:
+        return False
+    host = (u.hostname or "").lower()
+    # RFC 8252 s7.3: native/desktop clients (ChatGPT app, Claude Code, mcp-remote)
+    # listen on a loopback socket with an EPHEMERAL port and a random path, e.g.
+    # http://127.0.0.1:63959/callback/dRmFLUYR9mxS. The port cannot be known in
+    # advance, so it must not be pinned; http is correct for loopback. Safe here:
+    # the code is still PKCE-bound and /authorize is still password-gated.
+    if u.scheme == "http" and host in _LOOPBACK_HOSTS:
+        return True
+    return (
+        u.scheme == "https"
+        and u.port is None
+        and host in _REDIRECT_HOSTS
+        and any(u.path.startswith(p) for p in _REDIRECT_PATH_PREFIXES)
+    )
+
+
+def _issue_tokens(scope: str, aud: str = ""):
     now = int(time.time())
-    access = _sign({"typ": "access", "scope": scope, "iat": now, "exp": now + ACCESS_TTL})
-    refresh = _sign({"typ": "refresh", "scope": scope, "iat": now, "exp": now + REFRESH_TTL})
+    base = {"scope": scope, "iat": now}
+    if aud:
+        base["aud"] = aud
+    access = _sign({"typ": "access", "exp": now + ACCESS_TTL, **base})
+    refresh = _sign({"typ": "refresh", "exp": now + REFRESH_TTL, **base})
     return JSONResponse(
         {
             "access_token": access,
@@ -247,7 +290,7 @@ background:#d97757;color:#fff;font-size:14px;font-weight:600;cursor:pointer}}
 .err{{color:#e5675a;font-size:13px;margin-top:12px}}</style></head><body>
 <form method=post action="{base}/authorize">
 <h1>WhatsApp (read-only)</h1>
-<p>Claude'a bu bağlantıyı vermek için parolanı gir.</p>
+<p>Bu bağlantıyı vermek için parolanı gir.</p>
 <input type=password name=password placeholder=Parola autofocus>
 {hidden}{err}
 <button type=submit>İzin ver</button></form></body></html>"""
@@ -255,10 +298,10 @@ background:#d97757;color:#fff;font-size:14px;font-weight:600;cursor:pointer}}
 
 def _consent_page(params: dict, err: bool = False):
     fields = ["response_type", "client_id", "redirect_uri", "state",
-              "code_challenge", "code_challenge_method", "scope"]
+              "code_challenge", "code_challenge_method", "scope", "resource"]
     hidden = "".join(
         '<input type=hidden name="{}" value="{}">'.format(
-            f, (params.get(f, "") or "").replace('"', "&quot;"))
+            f, html.escape(params.get(f, "") or "", quote=True))
         for f in fields
     )
     errhtml = '<div class=err>Parola yanlış.</div>' if err else ""
@@ -272,7 +315,8 @@ async def authorize(request: Request):
         if p.get("response_type") != "code" or not p.get("code_challenge") \
                 or p.get("code_challenge_method") != "S256":
             return JSONResponse({"error": "invalid_request"}, status_code=400)
-        if p.get("redirect_uri") not in REDIRECT_ALLOWLIST:
+        if not _redirect_ok(p.get("redirect_uri", "")):
+            print("rejected redirect_uri:", p.get("redirect_uri", ""), flush=True)
             return JSONResponse({"error": "invalid_redirect_uri"}, status_code=400)
         return _consent_page(p)
 
@@ -280,7 +324,8 @@ async def authorize(request: Request):
     if not hmac.compare_digest(form.get("password", ""), CONSENT_PASSWORD):
         return _consent_page(form, err=True)
     redirect_uri = form.get("redirect_uri", "")
-    if redirect_uri not in REDIRECT_ALLOWLIST:
+    if not _redirect_ok(redirect_uri):
+        print("rejected redirect_uri:", redirect_uri, flush=True)
         return JSONResponse({"error": "invalid_redirect_uri"}, status_code=400)
     now = int(time.time())
     code = _sign({
@@ -288,11 +333,14 @@ async def authorize(request: Request):
         "cc": form.get("code_challenge", ""),
         "ru": redirect_uri,
         "scope": form.get("scope") or "whatsapp:read",
+        # ChatGPT sends RFC 8707 `resource` on /authorize and /token; carry it
+        # through so it can be echoed back as the token audience.
+        "aud": form.get("resource") or "",
     })
     sep = "&" if "?" in redirect_uri else "?"
     dest = "{}{}code={}".format(redirect_uri, sep, code)
     if form.get("state"):
-        dest += "&state=" + form["state"]
+        dest += "&state=" + quote(form["state"], safe="")
     return RedirectResponse(dest, status_code=302)
 
 
@@ -312,13 +360,15 @@ async def token(request: Request):
             return err("invalid_grant")
         if not _pkce_ok(form.get("code_verifier", ""), p.get("cc", "")):
             return err("invalid_grant")
-        return _issue_tokens(p.get("scope", "whatsapp:read"))
+        return _issue_tokens(p.get("scope", "whatsapp:read"),
+                             form.get("resource") or p.get("aud", ""))
 
     if grant == "refresh_token":
         p = _verify(form.get("refresh_token", ""), "refresh")
         if not p:
             return err("invalid_grant")
-        return _issue_tokens(p.get("scope", "whatsapp:read"))
+        return _issue_tokens(p.get("scope", "whatsapp:read"),
+                             form.get("resource") or p.get("aud", ""))
 
     return err("unsupported_grant_type")
 
