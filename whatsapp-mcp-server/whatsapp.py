@@ -70,45 +70,124 @@ def list_accounts() -> List[str]:
 # {lid -> name} once per account (cached), preferring the user's saved chat name,
 # then contact full/first/push name.
 import time as _time
+import unicodedata as _ud
 
-_LID_CACHE = {}          # messages_db path -> (loaded_at, {bare_lid: name})
-_LID_TTL = 300           # seconds
+_LID_CACHE = {}          # messages_db path -> (checked_at, db_stamp, index)
+_LID_RECHECK = 2.0       # seconds between disk-change checks
+
+# Turkish dotless/dotted i survive NFKD unchanged, so fold them explicitly.
+_FOLD_MAP = str.maketrans({"\u0131": "i", "\u0130": "i", "I": "i"})
 
 
-def _load_lid_names(db_path: str) -> dict:
+def _norm(value) -> str:
+    """Fold a string for accent- and case-insensitive matching.
+
+    SQLite's own LOWER()/LIKE fold ASCII only, so "Bet\u00fcl" never matched
+    "betul" and "\u0130STANBUL" never matched "istanbul". Every name and content
+    comparison goes through this one function, so search behaves identically in
+    every tool.
+    """
+    if value is None:
+        return ""
+    text = str(value).translate(_FOLD_MAP).casefold()
+    text = _ud.normalize("NFKD", text)
+    return "".join(ch for ch in text if not _ud.combining(ch))
+
+
+def _db_stamp(*paths) -> tuple:
+    """Cheap change detector: (size, mtime) for each file, None when missing."""
+    out = []
+    for path in paths:
+        try:
+            st = os.stat(path)
+            out.append((st.st_size, st.st_mtime_ns))
+        except OSError:
+            out.append(None)
+    return tuple(out)
+
+
+def _load_lid_index(db_path: str) -> dict:
+    """Build and cache {"lid_name": {lid: name}, "pn_lids": {pn: [lid, ...]}}.
+
+    Rebuilt whenever either database changes on disk (checked at most every
+    _LID_RECHECK seconds), so a newly saved contact or a fresh LID mapping shows
+    up without restarting the server.
+    """
     now = _time.time()
     cached = _LID_CACHE.get(db_path)
-    if cached and now - cached[0] < _LID_TTL:
-        return cached[1]
-    names: dict = {}
+    if cached and now - cached[0] < _LID_RECHECK:
+        return cached[2]
+
     wa_db = os.path.join(os.path.dirname(os.path.abspath(db_path)), "whatsapp.db")
+    stamp = _db_stamp(db_path, wa_db)
+    if cached and cached[1] == stamp:
+        _LID_CACHE[db_path] = (now, stamp, cached[2])
+        return cached[2]
+
+    lid_name: dict = {}
+    pn_lids: dict = {}
+    lid_pushname: dict = {}
     try:
         pn_name: dict = {}
         mc = sqlite3.connect(db_path)
-        for jid, nm in mc.execute(
-            "SELECT jid, name FROM chats WHERE jid LIKE '%@s.whatsapp.net' AND name IS NOT NULL AND name <> ''"
-        ):
-            if nm and not str(nm).isdigit():
-                pn_name.setdefault(jid.split("@")[0], nm)
-        mc.close()
+        try:
+            for jid, nm in mc.execute(
+                "SELECT jid, name FROM chats "
+                "WHERE jid LIKE '%@s.whatsapp.net' AND name IS NOT NULL AND name <> ''"
+            ):
+                if nm and not str(nm).isdigit():
+                    pn_name.setdefault(jid.split("@")[0], nm)
+        finally:
+            mc.close()
+
         if os.path.exists(wa_db):
             wc = sqlite3.connect(wa_db)
-            for tj, full, first, push in wc.execute(
-                "SELECT their_jid, full_name, first_name, push_name FROM whatsmeow_contacts WHERE their_jid LIKE '%@s.whatsapp.net'"
-            ):
-                pn = (tj or "").split("@")[0]
-                nm = full or first or push
-                if pn and nm and pn not in pn_name and not str(nm).isdigit():
-                    pn_name[pn] = nm
-            for lid, pn in wc.execute("SELECT lid, pn FROM whatsmeow_lid_map"):
-                nm = pn_name.get(str(pn))
-                if nm:
-                    names[str(lid)] = nm
-            wc.close()
+            try:
+                for tj, full, first, push in wc.execute(
+                    "SELECT their_jid, full_name, first_name, push_name FROM whatsmeow_contacts"
+                ):
+                    ident = str(tj or "").split("@")[0]
+                    nm = full or first or push
+                    if not ident or not nm or str(nm).isdigit():
+                        continue
+                    if str(tj).endswith("@lid"):
+                        # A LID-keyed contact row usually carries only the push
+                        # name -- what the other person calls themselves. That
+                        # must never outrank the name the user saved, so hold it
+                        # aside and apply it below only where nothing else won.
+                        lid_pushname.setdefault(ident, nm)
+                    else:
+                        pn_name.setdefault(ident, nm)
+
+                for lid, pn in wc.execute("SELECT lid, pn FROM whatsmeow_lid_map"):
+                    lid_b = str(lid).split("@")[0]
+                    pn_b = str(pn).split("@")[0]
+                    if not lid_b or not pn_b:
+                        continue
+                    peers = pn_lids.setdefault(pn_b, [])
+                    if lid_b not in peers:
+                        peers.append(lid_b)
+                    nm = pn_name.get(pn_b)
+                    if nm:
+                        lid_name.setdefault(lid_b, nm)
+
+                # Gap filler only: LIDs the map could not tie back to a saved
+                # name still get the push name rather than a bare number.
+                for lid_b, nm in lid_pushname.items():
+                    lid_name.setdefault(lid_b, nm)
+            finally:
+                wc.close()
     except sqlite3.Error as e:
-        print(f"lid name load error: {e}")
-    _LID_CACHE[db_path] = (now, names)
-    return names
+        print(f"lid index load error: {e}")
+
+    index = {"lid_name": lid_name, "pn_lids": pn_lids}
+    _LID_CACHE[db_path] = (now, stamp, index)
+    return index
+
+
+def _load_lid_names(db_path: str) -> dict:
+    """{bare_lid: name}, kept for callers that only need the name map."""
+    return _load_lid_index(db_path)["lid_name"]
 
 
 def resolve_lid_name(identifier: Optional[str], db_path: str, fallback=None):
@@ -117,7 +196,52 @@ def resolve_lid_name(identifier: Optional[str], db_path: str, fallback=None):
     if not identifier:
         return fallback
     bare = str(identifier).split("@")[0]
-    return _load_lid_names(db_path).get(bare, fallback)
+    return _load_lid_index(db_path)["lid_name"].get(bare, fallback)
+
+
+def display_name(jid: Optional[str], raw_name, db_path: str):
+    """The single name a caller ever sees for a chat.
+
+    Filtering and sorting run through this same function (exposed to SQL as
+    wa_name()), so a chat can never be visible in a listing yet invisible to a
+    search for the very name that listing showed.
+    """
+    resolved = resolve_lid_name(jid, db_path, fallback=raw_name)
+    if resolved is None or str(resolved).strip() == "":
+        return raw_name
+    return resolved
+
+
+def jid_aliases(identifier: Optional[str], db_path: str) -> List[str]:
+    """Every bare identifier that refers to the same person: the phone-number
+    form plus every LID it has been migrated to, in both directions."""
+    bare = str(identifier or "").split("@")[0]
+    if not bare:
+        return []
+    index = _load_lid_index(db_path)
+    out = [bare]
+    for lid in index["pn_lids"].get(bare, []):
+        if lid not in out:
+            out.append(lid)
+    for pn, lids in index["pn_lids"].items():
+        if bare in lids and pn not in out:
+            out.append(pn)
+    return out
+
+
+def _connect(db_path: str) -> sqlite3.Connection:
+    """Open the messages DB with the shared name helpers registered.
+
+    wa_name(jid, name)   -> the display name, byte-identical to what tools return
+    wa_match(hay, needle) -> 1 when needle occurs in hay, accent/case-folded
+
+    Every read goes through here, so a query can never filter on a different
+    notion of "name" than the one it returns.
+    """
+    conn = sqlite3.connect(db_path)
+    conn.create_function("wa_name", 2, lambda jid, nm: display_name(jid, nm, db_path))
+    conn.create_function("wa_match", 2, lambda hay, needle: 1 if _norm(needle) in _norm(hay) else 0)
+    return conn
 
 # ---------------------------------------------------------------------------
 
@@ -165,7 +289,7 @@ def get_sender_name(sender_jid: str, db_path: str) -> str:
     if _lid:
         return _lid
     try:
-        conn = sqlite3.connect(db_path)
+        conn = _connect(db_path)
         cursor = conn.cursor()
 
         # First try matching by exact JID
@@ -256,7 +380,7 @@ def list_messages(
     """Get messages matching the specified criteria with optional context."""
     db_path, _ = _resolve(account)
     try:
-        conn = sqlite3.connect(db_path)
+        conn = _connect(db_path)
         cursor = conn.cursor()
 
         # Build base query
@@ -293,8 +417,8 @@ def list_messages(
             params.append(chat_jid)
 
         if query:
-            where_clauses.append("LOWER(messages.content) LIKE LOWER(?)")
-            params.append(f"%{query}%")
+            where_clauses.append("wa_match(messages.content, ?) = 1")
+            params.append(query)
 
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
@@ -353,7 +477,7 @@ def get_message_context(
     """Get context around a specific message."""
     db_path, _ = _resolve(account)
     try:
-        conn = sqlite3.connect(db_path)
+        conn = _connect(db_path)
         cursor = conn.cursor()
 
         # Get the target message first
@@ -450,39 +574,55 @@ def list_chats(
     """Get chats matching the specified criteria."""
     db_path, _ = _resolve(account)
     try:
-        conn = sqlite3.connect(db_path)
+        conn = _connect(db_path)
         cursor = conn.cursor()
 
-        # Build base query
-        query_parts = ["""
-            SELECT
-                chats.jid,
-                chats.name,
-                chats.last_message_time,
-                messages.content as last_message,
-                messages.sender as last_sender,
-                messages.is_from_me as last_is_from_me
-            FROM chats
-        """]
-
+        # Build base query. The last-message columns only exist when the
+        # messages table is actually joined -- selecting them unconditionally
+        # made include_last_message=False fail with "no such column" and return
+        # an empty list instead of the chats it was asked for.
         if include_last_message:
-            query_parts.append("""
+            query_parts = ["""
+                SELECT
+                    chats.jid,
+                    chats.name,
+                    chats.last_message_time,
+                    messages.content as last_message,
+                    messages.sender as last_sender,
+                    messages.is_from_me as last_is_from_me
+                FROM chats
                 LEFT JOIN messages ON chats.jid = messages.chat_jid
                 AND chats.last_message_time = messages.timestamp
-            """)
+            """]
+        else:
+            query_parts = ["""
+                SELECT
+                    chats.jid,
+                    chats.name,
+                    chats.last_message_time,
+                    NULL as last_message,
+                    NULL as last_sender,
+                    NULL as last_is_from_me
+                FROM chats
+            """]
 
         where_clauses = []
         params = []
 
         if query:
-            where_clauses.append("(LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?)")
-            params.extend([f"%{query}%", f"%{query}%"])
+            where_clauses.append(
+                "(wa_match(wa_name(chats.jid, chats.name), ?) = 1 OR chats.jid LIKE ?)"
+            )
+            params.extend([query, f"%{query}%"])
 
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
 
         # Add sorting
-        order_by = "chats.last_message_time DESC" if sort_by == "last_active" else "chats.name"
+        order_by = (
+            "chats.last_message_time DESC" if sort_by == "last_active"
+            else "wa_name(chats.jid, chats.name)"
+        )
         query_parts.append(f"ORDER BY {order_by}")
 
         # Add pagination
@@ -497,7 +637,7 @@ def list_chats(
         for chat_data in chats:
             chat = Chat(
                 jid=chat_data[0],
-                name=resolve_lid_name(chat_data[0], db_path, fallback=chat_data[1]),
+                name=display_name(chat_data[0], chat_data[1], db_path),
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
                 last_sender=chat_data[4],
@@ -519,23 +659,25 @@ def search_contacts(query: str, account: Optional[str] = None) -> List[Contact]:
     """Search contacts by name or phone number."""
     db_path, _ = _resolve(account)
     try:
-        conn = sqlite3.connect(db_path)
+        conn = _connect(db_path)
         cursor = conn.cursor()
 
-        # Split query into characters to support partial matching
-        search_pattern = '%' +query + '%'
+        # Names are matched accent- and case-folded via wa_match; the raw
+        # pattern is only used for the phone-number/JID half of the search.
+        search_pattern = '%' + query + '%'
 
         cursor.execute("""
             SELECT DISTINCT
                 jid,
-                name
+                name,
+                last_message_time
             FROM chats
             WHERE
-                (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
+                (wa_match(wa_name(jid, name), ?) = 1 OR jid LIKE ?)
                 AND jid NOT LIKE '%@g.us'
-            ORDER BY name, jid
+            ORDER BY last_message_time DESC
             LIMIT 50
-        """, (search_pattern, search_pattern))
+        """, (query, search_pattern))
 
         contacts = cursor.fetchall()
 
@@ -543,7 +685,7 @@ def search_contacts(query: str, account: Optional[str] = None) -> List[Contact]:
         for contact_data in contacts:
             contact = Contact(
                 phone_number=contact_data[0].split('@')[0],
-                name=contact_data[1],
+                name=display_name(contact_data[0], contact_data[1], db_path),
                 jid=contact_data[0]
             )
             result.append(contact)
@@ -568,10 +710,20 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0, account: Optiona
     """
     db_path, _ = _resolve(account)
     try:
-        conn = sqlite3.connect(db_path)
+        conn = _connect(db_path)
         cursor = conn.cursor()
 
-        cursor.execute("""
+        # Match every JID this contact owns (phone-number form and LIDs), so
+        # the history does not split in half at a LID migration.
+        aliases = jid_aliases(jid, db_path) or [str(jid).split("@")[0]]
+        alias_clause = " OR ".join(
+            ["m.sender LIKE ? OR c.jid LIKE ?"] * len(aliases)
+        )
+        alias_params = []
+        for alias in aliases:
+            alias_params.extend([f"{alias}@%", f"{alias}@%"])
+
+        cursor.execute(f"""
             SELECT DISTINCT
                 c.jid,
                 c.name,
@@ -581,10 +733,10 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0, account: Optiona
                 m.is_from_me as last_is_from_me
             FROM chats c
             JOIN messages m ON c.jid = m.chat_jid
-            WHERE m.sender = ? OR c.jid = ?
+            WHERE m.sender = ? OR c.jid = ? OR {alias_clause}
             ORDER BY c.last_message_time DESC
             LIMIT ? OFFSET ?
-        """, (jid, jid, limit, page * limit))
+        """, tuple([jid, jid] + alias_params + [limit, page * limit]))
 
         chats = cursor.fetchall()
 
@@ -592,7 +744,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0, account: Optiona
         for chat_data in chats:
             chat = Chat(
                 jid=chat_data[0],
-                name=resolve_lid_name(chat_data[0], db_path, fallback=chat_data[1]),
+                name=display_name(chat_data[0], chat_data[1], db_path),
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
                 last_sender=chat_data[4],
@@ -614,7 +766,7 @@ def get_last_interaction(jid: str, account: Optional[str] = None) -> str:
     """Get most recent message involving the contact."""
     db_path, _ = _resolve(account)
     try:
-        conn = sqlite3.connect(db_path)
+        conn = _connect(db_path)
         cursor = conn.cursor()
 
         cursor.execute("""
@@ -664,7 +816,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True, account: Optional
     """Get chat metadata by JID."""
     db_path, _ = _resolve(account)
     try:
-        conn = sqlite3.connect(db_path)
+        conn = _connect(db_path)
         cursor = conn.cursor()
 
         query = """
@@ -694,7 +846,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True, account: Optional
 
         return Chat(
             jid=chat_data[0],
-            name=resolve_lid_name(chat_data[0], db_path, fallback=chat_data[1]),
+            name=display_name(chat_data[0], chat_data[1], db_path),
             last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
             last_message=chat_data[3],
             last_sender=chat_data[4],
@@ -713,10 +865,22 @@ def get_direct_chat_by_contact(sender_phone_number: str, account: Optional[str] 
     """Get chat metadata by sender phone number."""
     db_path, _ = _resolve(account)
     try:
-        conn = sqlite3.connect(db_path)
+        conn = _connect(db_path)
         cursor = conn.cursor()
 
-        cursor.execute("""
+        # One person can own several JIDs at once: the original phone-number
+        # form plus every LID WhatsApp migrated them to. Match all of them and
+        # return the most recently active chat, so a lookup by phone number
+        # never lands on a chat that froze at the migration.
+        aliases = jid_aliases(sender_phone_number, db_path)
+        if aliases:
+            clauses = " OR ".join(["c.jid LIKE ?"] * len(aliases))
+            params = [f"{alias}@%" for alias in aliases]
+        else:
+            clauses = "c.jid LIKE ?"
+            params = [f"%{sender_phone_number}%"]
+
+        cursor.execute(f"""
             SELECT
                 c.jid,
                 c.name,
@@ -727,9 +891,10 @@ def get_direct_chat_by_contact(sender_phone_number: str, account: Optional[str] 
             FROM chats c
             LEFT JOIN messages m ON c.jid = m.chat_jid
                 AND c.last_message_time = m.timestamp
-            WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
+            WHERE ({clauses}) AND c.jid NOT LIKE '%@g.us'
+            ORDER BY c.last_message_time DESC
             LIMIT 1
-        """, (f"%{sender_phone_number}%",))
+        """, tuple(params))
 
         chat_data = cursor.fetchone()
 
@@ -738,7 +903,7 @@ def get_direct_chat_by_contact(sender_phone_number: str, account: Optional[str] 
 
         return Chat(
             jid=chat_data[0],
-            name=resolve_lid_name(chat_data[0], db_path, fallback=chat_data[1]),
+            name=display_name(chat_data[0], chat_data[1], db_path),
             last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
             last_message=chat_data[3],
             last_sender=chat_data[4],

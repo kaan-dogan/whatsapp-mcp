@@ -77,3 +77,85 @@ VPS'te (SSH):
 
 check_bridge whatsapp-bridge  "ana hesap (main)"      /var/log/whatsapp-bridge.log  /root/whatsapp/bridge
 check_bridge whatsapp-bridge2 "ikinci hesap (second)" /var/log/whatsapp-bridge2.log /root/whatsapp/bridge2
+
+# 3) search integrity — the quiet failure mode
+# ------------------------------------------------
+# A bridge can be up, authenticated and writing messages while every
+# name-based query still returns nothing: that is exactly what the June 2026
+# @lid migration did, and it went unnoticed for weeks because listings kept
+# showing names. selfcheck.py asserts the invariant that catches it -- whatever
+# a listing shows by name must be findable by that name. Hourly is enough; the
+# failure is structural, not intermittent.
+# The MCP source dir and its interpreter are discovered rather than hardcoded,
+# so a future relocation degrades to "check skipped" instead of "check silently
+# passes". SELFCHECK_DIR / SELFCHECK_PY in the .env override the search.
+SELFCHECK_EVERY=${SELFCHECK_EVERY:-3600}
+SELFCHECK_DIR=${SELFCHECK_DIR:-}
+SELFCHECK_PY=${SELFCHECK_PY:-}
+
+find_selfcheck() {
+  local d
+  if [ -n "$SELFCHECK_DIR" ]; then echo "$SELFCHECK_DIR"; return; fi
+  for d in /root/whatsapp/mcp /root/whatsapp/mcp-server /root/whatsapp/whatsapp-mcp-server; do
+    [ -f "$d/selfcheck.py" ] && { echo "$d"; return; }
+  done
+  echo ""
+}
+
+find_python() {
+  local d="$1" p
+  if [ -n "$SELFCHECK_PY" ]; then echo "$SELFCHECK_PY"; return; fi
+  for p in "$d/.venv/bin/python" "$d/venv/bin/python" /root/whatsapp/mcp/.venv/bin/python; do
+    [ -x "$p" ] && { echo "$p"; return; }
+  done
+  echo python3
+}
+
+check_search_integrity() {
+  local dir py
+  dir=$(find_selfcheck)
+  if [ -z "$dir" ]; then
+    if [ ! -f "$STATE/selfcheck_missing" ]; then
+      notify "ℹ️ WhatsApp arama kontrolü atlandı: selfcheck.py bulunamadı (SELFCHECK_DIR ayarla)."
+      touch "$STATE/selfcheck_missing"
+    fi
+    return 0
+  fi
+  rm -f "$STATE/selfcheck_missing"
+  py=$(find_python "$dir")
+
+  local last_file="$STATE/selfcheck_last" last now
+  now=$(date +%s)
+  last=$(cat "$last_file" 2>/dev/null || echo 0)
+  [ $((now - last)) -lt "$SELFCHECK_EVERY" ] && return 0
+  echo "$now" > "$last_file"
+
+  # Take the account map from the MCP unit itself, so this never drifts from
+  # what the server actually reads.
+  local accounts
+  accounts=$(systemctl show whatsapp-mcp -p Environment --value 2>/dev/null \
+             | tr ' ' '\n' | sed -n 's/^WHATSAPP_ACCOUNTS=//p')
+  if [ -z "$accounts" ] && [ -f "$dir/.env" ]; then
+    accounts=$(sed -n 's/^WHATSAPP_ACCOUNTS=//p' "$dir/.env" | tail -1 | sed 's/^"//; s/"$//')
+  fi
+
+  local out rc
+  out=$(cd "$dir" && WHATSAPP_ACCOUNTS="$accounts" timeout 120 "$py" selfcheck.py 2>&1)
+  rc=$?
+
+  if [ "$rc" -ne 0 ]; then
+    if [ ! -f "$STATE/selfcheck_fail" ]; then
+      notify "🔍 WhatsApp arama BOZUK — servisler ayakta ama isimle arama sonuç döndürmüyor.
+
+$(grep -E '^\s+(FAIL|ERROR)' <<<"$out" | head -6)
+
+VPS'te: cd $dir && $py selfcheck.py"
+      touch "$STATE/selfcheck_fail"
+    fi
+  elif [ -f "$STATE/selfcheck_fail" ]; then
+    notify "✅ WhatsApp arama yeniden çalışıyor."
+    rm -f "$STATE/selfcheck_fail"
+  fi
+}
+
+check_search_integrity

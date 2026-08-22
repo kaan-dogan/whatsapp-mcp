@@ -20,6 +20,19 @@ remote MCP connector. Read-only: all send/download tools are stripped at startup
 > eu-central-1, 3.79.227.197), which is where `ingest.globalmentorluk.com`
 > resolves. SSM is not connected on that instance; reach it over plain SSH:
 > `ssh -i ~/.ssh/dora_aws root@3.79.227.197`.
+>
+> **Port 22 is allow-listed per source IP** on security group `ingest-box`
+> (`sg-0e11a456779314049`, eu-central-1). A home-ISP address change makes SSH
+> time out with no other symptom -- the box is fine, you are simply not on the
+> list. Check the current rules, then re-add yourself:
+>
+> ```bash
+> aws ec2 describe-security-groups --group-ids sg-0e11a456779314049 \
+>   --region eu-central-1 --query 'SecurityGroups[].IpPermissions' --output json
+> aws ec2 authorize-security-group-ingress --region eu-central-1 \
+>   --group-id sg-0e11a456779314049 --ip-permissions \
+>   "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=$(curl -s https://checkip.amazonaws.com | tr -d '\n')/32,Description=kaan-home}]"
+> ```
 
 - Source: `/root/whatsapp/mcp/` (venv with `mcp[cli]` 1.28), `.env` (chmod 600)
 - Service: `whatsapp-mcp.service` (systemd), boot-enabled
@@ -86,3 +99,37 @@ Guarantees:
 Enabling sends changes the blast radius of `WHATSAPP_MCP_TOKEN` from "can read
 all chats" to "can also message clients". The allowlist caps that to the groups
 above; rotate the token when enabling.
+
+## Search integrity (`selfcheck.py`)
+
+The June 2026 `@lid` migration produced a failure nobody noticed for weeks: the
+bridges were up and storing messages, listings still showed contact names, but
+every name-based query returned nothing — the display name was resolved in
+Python after the SQL ran, while the SQL still filtered on the raw `chats.name`
+column, which for LID rows holds an opaque number. Anything that starts from a
+name ("what did I write to X?") came back empty all the way down.
+
+Two things now prevent a silent repeat:
+
+- **One name, one code path.** `display_name()` is the only source of a chat's
+  name, and it is registered on every connection as the SQL function
+  `wa_name(jid, name)`. Filters and sorts call it, so a chat can never be
+  visible in a listing yet invisible to a search for the name that listing
+  showed. `wa_match()` does the comparison with Unicode folding, so `Betül`,
+  `betul` and `BETUL` all match (SQLite's own `LOWER()`/`LIKE` fold ASCII only,
+  which quietly broke every Turkish name).
+- **An assertion that fails loudly.** `selfcheck.py` takes the chats a listing
+  returns and demands each one be findable by its own name, per account. Run it
+  by hand after any deploy:
+
+  ```bash
+  cd /root/whatsapp/mcp && WHATSAPP_ACCOUNTS="$(sed -n 's/^WHATSAPP_ACCOUNTS=//p' .env)" python3 selfcheck.py
+  ```
+
+  `vps-watchdog/watchdog.sh` also runs it hourly and alerts to Telegram on
+  failure, so the next migration surfaces as a message rather than as months of
+  empty results. Set `SELFCHECK_DIR` / `SELFCHECK_PY` in the watchdog `.env` if
+  the layout moves; the check reports "skipped", never a false pass.
+
+Deploying the fix means copying `whatsapp.py` **and** `selfcheck.py`, then
+restarting `whatsapp-mcp.service`.
