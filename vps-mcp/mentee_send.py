@@ -167,7 +167,7 @@ def send_to_mentee_group(chat_jid: str, message: str, dry_run: bool = False) -> 
     to see the permitted JIDs - never guess a JID from a group name.
 
     Args:
-        chat_jid: Group JID, e.g. "120363408193283158@g.us". Must match an
+        chat_jid: Group JID, e.g. "120363000000000000@g.us". Must match an
                   allowlist entry exactly.
         message: The message text.
         dry_run: When true, run every validation and report the outcome
@@ -272,10 +272,10 @@ def send_file_to_mentee_group(
     to see them, never guess a JID from a group name.
 
     The student sees the staged filename as the document title, so upload the
-    file under the name they should read (e.g. "Ada - Danismanlik Raporu.pdf").
+    file under the name they should read (e.g. "Ogrenci - Rapor.pdf").
 
     Args:
-        chat_jid: Group JID, e.g. "120363408193283158@g.us".
+        chat_jid: Group JID, e.g. "120363000000000000@g.us".
         handle: UUID returned by the outbox upload.
         caption: Optional text delivered with the document, as one message.
         dry_run: Run every validation and report what would happen, sending
@@ -348,7 +348,7 @@ def stage_from_drive(file_id: str, filename: str = "") -> dict:
     outbox token.
 
     Args:
-        file_id: Drive file id, e.g. "1iae_r2YU9Xvl7PSmW9AW0ZYro8dI80vn".
+        file_id: Drive file id, e.g. "1AbCdEfGhIjKlMnOpQrStUvWxYz012345".
         filename: Optional override for the document title the student sees.
                   Defaults to the file's own Drive name.
 

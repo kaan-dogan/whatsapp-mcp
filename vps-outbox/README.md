@@ -25,8 +25,8 @@ Measured, not assumed:
 
 | File | `gog drive download` |
 |---|---|
-| `Pinar_Turan_Aday_Brifingi` (VPS pipeline output) | 92 565 bytes |
-| Görüşme özeti PDF (VPS pipeline output) | 131 024 bytes |
+| A briefing PDF the pipeline rendered | 92 565 bytes |
+| A meeting-summary PDF the pipeline rendered | 131 024 bytes |
 | A PDF added to Drive by hand | `404 notFound` |
 
 So the pipeline's own output — reports, meeting summaries, aday brifingi — is
@@ -57,7 +57,7 @@ are deleted after `OUTBOX_TTL_HOURS` (24).
 
 **The filename becomes what the student sees.** The bridge sets the document
 title from the staged file's name, so upload under the name they should read —
-`Ada — Danışmanlık Raporu.pdf`, not `output.pdf`. Directory parts, control
+`Öğrenci — Danışmanlık Raporu.pdf`, not `output.pdf`. Directory parts, control
 characters and leading dots are stripped; the name is otherwise preserved,
 Turkish characters included.
 
@@ -97,7 +97,7 @@ one message.
 
 ```bash
 TOKEN=$(ssh root@<host> 'sed -n "s/^WHATSAPP_OUTBOX_TOKEN=//p" /root/whatsapp/outbox-svc/.env')
-curl -s -X POST "https://ingest.example.com/outbox/?filename=Ada%20-%20Rapor.pdf" \
+curl -s -X POST "https://ingest.example.com/outbox/?filename=Ogrenci%20-%20Rapor.pdf" \
   -H "Authorization: Bearer $TOKEN" --data-binary @rapor.pdf
 # -> {"handle":"a914e6f0-...", ...}
 ```

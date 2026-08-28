@@ -50,8 +50,8 @@ class Failure(Exception):
 def check_folding():
     """Turkish and accented text must fold before it is compared."""
     cases = [
-        ("Betül Danış", "betul"),
-        ("Betül Danış", "DANIS"),
+        ("Ünlü Çiçekçi", "unlu cicekci"),
+        ("Ünlü Çiçekçi", "CICEKCI"),
         ("İSTANBUL", "istanbul"),
         ("Çınar", "cinar"),
         ("Şeyma", "seyma"),

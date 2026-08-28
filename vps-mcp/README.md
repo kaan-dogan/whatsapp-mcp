@@ -115,8 +115,8 @@ Two things now prevent a silent repeat:
   name, and it is registered on every connection as the SQL function
   `wa_name(jid, name)`. Filters and sorts call it, so a chat can never be
   visible in a listing yet invisible to a search for the name that listing
-  showed. `wa_match()` does the comparison with Unicode folding, so `Betül`,
-  `betul` and `BETUL` all match (SQLite's own `LOWER()`/`LIKE` fold ASCII only,
+  showed. `wa_match()` does the comparison with Unicode folding, so `Çiçek`,
+  `cicek` and `CICEK` all match (SQLite's own `LOWER()`/`LIKE` fold ASCII only,
   which quietly broke every Turkish name).
 - **An assertion that fails loudly.** `selfcheck.py` takes the chats a listing
   returns and demands each one be findable by its own name, per account. Run it
