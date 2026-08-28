@@ -946,7 +946,11 @@ def send_message(recipient: str, message: str, account: Optional[str] = None) ->
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
 
-def send_file(recipient: str, media_path: str, account: Optional[str] = None) -> Tuple[bool, str]:
+def send_file(recipient: str, media_path: str, account: Optional[str] = None,
+              message: str = "") -> Tuple[bool, str]:
+    """Send a file. `message` rides along as the media caption -- the bridge puts
+    it on the DocumentMessage, so the file and its explanation arrive as one
+    message instead of two."""
     _, api_base_url = _resolve(account)
     try:
         # Validate input
@@ -962,7 +966,8 @@ def send_file(recipient: str, media_path: str, account: Optional[str] = None) ->
         url = f"{api_base_url}/send"
         payload = {
             "recipient": recipient,
-            "media_path": media_path
+            "media_path": media_path,
+            "message": message,
         }
 
         response = requests.post(url, json=payload)

@@ -19,10 +19,12 @@ Fails closed: a missing, unreadable, or malformed allowlist denies every send.
 
 import json
 import os
+import re
 import time
 
 import main
 from whatsapp import send_message as _wa_send
+from whatsapp import send_file as _wa_send_file
 
 ALLOWLIST_PATH = os.environ.get(
     "MENTEE_ALLOWLIST_PATH", "/root/whatsapp/mcp/allowlist.json"
@@ -32,6 +34,13 @@ AUDIT_PATH = os.environ.get(
 )
 MAX_LEN = int(os.environ.get("MENTEE_MAX_LEN", "2000"))
 VALID_ACCOUNTS = ("main", "second")
+
+# Files are only ever sent from the staging directory the outbox service writes
+# to. A handle is a UUID and nothing else, so a path outside OUTBOX_ROOT cannot
+# be expressed -- the tool never accepts a filesystem path from the caller.
+OUTBOX_ROOT = os.environ.get("OUTBOX_ROOT", "/root/whatsapp/outbox")
+OUTBOX_MAX_BYTES = int(os.environ.get("OUTBOX_MAX_BYTES", str(20 * 1024 * 1024)))
+_HANDLE_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
 def _load_allowlist() -> dict:
@@ -65,7 +74,7 @@ def _load_allowlist() -> dict:
     return entries
 
 
-def _audit(jid, name, allowed, reason, message, account, dry_run):
+def _audit(jid, name, allowed, reason, message, account, dry_run, extra=None):
     record = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "jid": jid,
@@ -76,6 +85,8 @@ def _audit(jid, name, allowed, reason, message, account, dry_run):
         "reason": reason,
         "preview": (message or "")[:80],
     }
+    if extra:
+        record.update(extra)
     try:
         with open(AUDIT_PATH, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -161,6 +172,119 @@ def send_to_mentee_group(chat_jid: str, message: str, dry_run: bool = False) -> 
         "name": entry["name"],
         "dry_run": False,
     }
+
+def _resolve_staged(handle):
+    """Turn an outbox handle into (path, filename, size). Returns (None, reason)
+    on any doubt -- the checks the outbox service already ran are repeated here
+    because this is the step that actually puts a file in front of a student."""
+    if not isinstance(handle, str) or not _HANDLE_RE.match(handle):
+        return None, "handle must be a UUID returned by the outbox upload"
+
+    directory = os.path.join(OUTBOX_ROOT, handle)
+    if not os.path.isdir(directory):
+        return None, "handle not found or already expired (staged files live 24h)"
+
+    names = [n for n in os.listdir(directory) if not n.startswith(".")]
+    if len(names) != 1:
+        return None, f"staging dir holds {len(names)} files, expected exactly 1"
+
+    path = os.path.join(directory, names[0])
+    # realpath before the prefix test, so a symlink planted in the staging dir
+    # cannot point the send at /root/.ssh/id_rsa.
+    real = os.path.realpath(path)
+    if not real.startswith(os.path.realpath(OUTBOX_ROOT) + os.sep):
+        return None, "resolved path escapes the outbox root"
+    if not os.path.isfile(real):
+        return None, "staged entry is not a regular file"
+
+    size = os.path.getsize(real)
+    if size == 0:
+        return None, "staged file is empty"
+    if size > OUTBOX_MAX_BYTES:
+        return None, f"staged file is {size} bytes, over the {OUTBOX_MAX_BYTES} limit"
+    try:
+        with open(real, "rb") as fh:
+            if fh.read(5) != b"%PDF-":
+                return None, "staged file is not a PDF"
+    except OSError as exc:
+        return None, f"staged file unreadable: {exc}"
+
+    return (real, names[0], size), None
+
+
+@main.mcp.tool()
+def send_file_to_mentee_group(
+    chat_jid: str, handle: str, caption: str = "", dry_run: bool = False
+) -> dict:
+    """Send a staged PDF to one allowlisted Global Mentorluk mentee group.
+
+    The file must already have been uploaded to the outbox service, which
+    returns the `handle` used here; this tool cannot read an arbitrary path.
+    Only group JIDs on the allowlist can be reached - call list_mentee_groups()
+    to see them, never guess a JID from a group name.
+
+    The student sees the staged filename as the document title, so upload the
+    file under the name they should read (e.g. "Ada - Danismanlik Raporu.pdf").
+
+    Args:
+        chat_jid: Group JID, e.g. "120363408193283158@g.us".
+        handle: UUID returned by the outbox upload.
+        caption: Optional text delivered with the document, as one message.
+        dry_run: Run every validation and report what would happen, sending
+                 nothing.
+
+    Returns:
+        {success, message, jid, name, filename, bytes, dry_run}
+    """
+    allowlist = _load_allowlist()
+
+    def deny(reason, name=None, extra=None):
+        _audit(chat_jid, name, False, reason, caption, None, dry_run,
+               dict(extra or {}, kind="file", handle=handle))
+        out = {"success": False, "message": reason, "jid": chat_jid,
+               "name": name, "dry_run": dry_run}
+        out.update(extra or {})
+        return out
+
+    if not isinstance(chat_jid, str) or not chat_jid:
+        return deny("chat_jid must be a non-empty string")
+    if not chat_jid.endswith("@g.us"):
+        return deny("Only group JIDs (@g.us) may be messaged; direct chats are blocked")
+    if chat_jid not in allowlist:
+        return deny("JID is not on the allowlist; call list_mentee_groups() for permitted groups")
+
+    entry = allowlist[chat_jid]
+
+    if not isinstance(caption, str):
+        return deny("caption must be a string", entry["name"])
+    if len(caption) > MAX_LEN:
+        return deny(f"caption exceeds {MAX_LEN} characters", entry["name"])
+
+    staged, reason = _resolve_staged(handle)
+    if staged is None:
+        return deny(reason, entry["name"])
+    path, filename, size = staged
+    facts = {"filename": filename, "bytes": size}
+
+    if dry_run:
+        _audit(chat_jid, entry["name"], True, "dry run - not sent", caption,
+               entry["account"], True, dict(facts, kind="file", handle=handle))
+        return dict(
+            {"success": True,
+             "message": f"Dry run: would send {filename} ({size} bytes) to "
+                        f"{entry['name']} from account '{entry['account']}'",
+             "jid": chat_jid, "name": entry["name"], "dry_run": True},
+            **facts,
+        )
+
+    ok, status = _wa_send_file(chat_jid, path, account=entry["account"], message=caption)
+    _audit(chat_jid, entry["name"], ok, status, caption, entry["account"], False,
+           dict(facts, kind="file", handle=handle))
+    return dict(
+        {"success": ok, "message": status, "jid": chat_jid,
+         "name": entry["name"], "dry_run": False},
+        **facts,
+    )
 
 
 print(
