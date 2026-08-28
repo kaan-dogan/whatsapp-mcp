@@ -287,7 +287,15 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 			mediaType = whatsmeow.MediaVideo
 			mimeType = "video/quicktime"
 
-		// Document types (for any other file type)
+		// Document types
+		case "pdf":
+			// Without this, a PDF falls through to the default below and goes
+			// out as application/octet-stream: it still arrives, but clients
+			// label it as an unknown file instead of showing it as a PDF.
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/pdf"
+
+		// Anything else still travels as a document
 		default:
 			mediaType = whatsmeow.MediaDocument
 			mimeType = "application/octet-stream"

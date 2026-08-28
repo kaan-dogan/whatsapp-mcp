@@ -112,12 +112,8 @@ you want to see the resolved group and filename before anything is sent.
 - Service: `whatsapp-outbox.service`, boot-enabled, `Restart=always`
 - Caddy: `handle_path /outbox/*` → `127.0.0.1:45411`, placed before the catch-all
 
-## Known rough edges
+## Known rough edge
 
-- The bridge's MIME table has no `pdf` case, so PDFs go out as
-  `application/octet-stream` (`whatsapp-bridge/main.go`, the `fileExt` switch).
-  Delivery works and the `.pdf` title is right, but adding a `pdf` case would
-  let clients label it properly. Needs a Go rebuild and a bridge restart.
 - The bridge only records an outgoing message in `messages.db` when the caption
   is non-empty (`if messageStore != nil && message != ""`). A document sent with
   no caption is delivered but invisible to `list_messages` afterwards. Passing a
