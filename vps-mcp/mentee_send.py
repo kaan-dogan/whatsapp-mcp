@@ -20,7 +20,11 @@ Fails closed: a missing, unreadable, or malformed allowlist denies every send.
 import json
 import os
 import re
+import shutil
+import subprocess
 import time
+import unicodedata
+import uuid
 
 import main
 from whatsapp import send_message as _wa_send
@@ -41,6 +45,50 @@ VALID_ACCOUNTS = ("main", "second")
 OUTBOX_ROOT = os.environ.get("OUTBOX_ROOT", "/root/whatsapp/outbox")
 OUTBOX_MAX_BYTES = int(os.environ.get("OUTBOX_MAX_BYTES", str(20 * 1024 * 1024)))
 _HANDLE_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+# Staging straight from Drive, for files the VPS pipeline itself produced. The
+# box's gog credential holds the drive.file scope, so this reaches exactly those
+# and returns a plain 404 for anything a human or the claude.ai connector put in
+# Drive -- for those, upload the bytes to the outbox service instead.
+GOG_BIN = os.environ.get("GOG_BIN", "gog")
+GOG_TIMEOUT = int(os.environ.get("GOG_TIMEOUT", "120"))
+_DRIVE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{10,200}$")
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _safe_filename(raw):
+    """Mirror of safeFilename() in vps-outbox/server.mjs: the student sees this
+    as the document title, and it also becomes a path segment."""
+    name = unicodedata.normalize("NFC", str(raw or ""))
+    name = re.split(r"[/\\]", name)[-1]
+    name = _CONTROL_CHARS.sub("", name)
+    name = name.lstrip(".").strip()
+    if not name:
+        name = "belge.pdf"
+    if not name.lower().endswith(".pdf"):
+        name += ".pdf"
+    if len(name.encode("utf-8")) > 180:
+        name = name[:-4][:120] + ".pdf"
+    return name
+
+
+def _gog(args):
+    """Run the gog Drive CLI. Returns (ok, stdout_or_error)."""
+    if not shutil.which(GOG_BIN):
+        return False, f"gog CLI not found (GOG_BIN={GOG_BIN})"
+    if not os.environ.get("GOG_ACCOUNT"):
+        return False, "GOG_ACCOUNT is not set for this service"
+    try:
+        proc = subprocess.run(
+            [GOG_BIN, "drive"] + args,
+            capture_output=True, text=True, timeout=GOG_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"gog timed out after {GOG_TIMEOUT}s"
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().replace("\n", " ")[:200]
+        return False, detail or f"gog exited {proc.returncode}"
+    return True, proc.stdout
 
 
 def _load_allowlist() -> dict:
@@ -285,6 +333,89 @@ def send_file_to_mentee_group(
          "name": entry["name"], "dry_run": False},
         **facts,
     )
+
+@main.mcp.tool()
+def stage_from_drive(file_id: str, filename: str = "") -> dict:
+    """Stage a Drive PDF into the outbox and return a handle to send it with.
+
+    Only reaches files the VPS pipeline produced itself (meeting summaries,
+    aday brifingi, rendered reports) - the box's Drive credential holds the
+    drive.file scope. A file added to Drive by hand or through the claude.ai
+    connector returns 'not visible to this server'; upload its bytes to the
+    outbox service instead.
+
+    Saves the round trip of downloading a file and posting it back, and needs no
+    outbox token.
+
+    Args:
+        file_id: Drive file id, e.g. "1iae_r2YU9Xvl7PSmW9AW0ZYro8dI80vn".
+        filename: Optional override for the document title the student sees.
+                  Defaults to the file's own Drive name.
+
+    Returns:
+        {success, handle, filename, bytes} - pass handle to
+        send_file_to_mentee_group.
+    """
+    if not isinstance(file_id, str) or not _DRIVE_ID_RE.match(file_id or ""):
+        return {"success": False, "message": "file_id is not a valid Drive id"}
+
+    ok, out = _gog(["get", file_id, "-j"])
+    if not ok:
+        if "404" in out or "notFound" in out:
+            return {"success": False, "message":
+                    "file not visible to this server (drive.file scope reaches only "
+                    "files the VPS pipeline uploaded); upload the bytes to the outbox instead"}
+        return {"success": False, "message": f"Drive metadata lookup failed: {out}"}
+
+    try:
+        meta = json.loads(out).get("file", {})
+    except (ValueError, AttributeError) as exc:
+        return {"success": False, "message": f"could not parse Drive metadata: {exc}"}
+
+    mime = meta.get("mimeType", "")
+    if mime != "application/pdf":
+        return {"success": False, "message": f"not a PDF in Drive (mimeType={mime or 'unknown'})"}
+    try:
+        size = int(meta.get("size") or 0)
+    except ValueError:
+        size = 0
+    if size > OUTBOX_MAX_BYTES:
+        return {"success": False, "message":
+                f"file is {size} bytes, over the {OUTBOX_MAX_BYTES} limit"}
+
+    name = _safe_filename(filename or meta.get("name") or file_id)
+    handle = str(uuid.uuid4())
+    directory = os.path.join(OUTBOX_ROOT, handle)
+    dest = os.path.join(directory, name)
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+    except OSError as exc:
+        return {"success": False, "message": f"could not create staging dir: {exc}"}
+
+    ok, out = _gog(["download", file_id, "--out", dest])
+    if not ok:
+        shutil.rmtree(directory, ignore_errors=True)
+        return {"success": False, "message": f"Drive download failed: {out}"}
+
+    # Believe the bytes, not the metadata: Drive's mimeType is a label the
+    # uploader chose, and this file is about to go to a student.
+    try:
+        with open(dest, "rb") as fh:
+            head = fh.read(5)
+        staged_bytes = os.path.getsize(dest)
+    except OSError as exc:
+        shutil.rmtree(directory, ignore_errors=True)
+        return {"success": False, "message": f"staged file unreadable: {exc}"}
+    if head != b"%PDF-":
+        shutil.rmtree(directory, ignore_errors=True)
+        return {"success": False, "message": "downloaded file is not a PDF"}
+    if staged_bytes > OUTBOX_MAX_BYTES:
+        shutil.rmtree(directory, ignore_errors=True)
+        return {"success": False, "message":
+                f"downloaded file is {staged_bytes} bytes, over the {OUTBOX_MAX_BYTES} limit"}
+
+    print(f"[mentee_send] staged {handle} {name} {staged_bytes}B from Drive {file_id}", flush=True)
+    return {"success": True, "handle": handle, "filename": name, "bytes": staged_bytes}
 
 
 print(

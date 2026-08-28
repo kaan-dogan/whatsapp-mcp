@@ -17,17 +17,26 @@ Two boundaries are kept apart on purpose:
   `mentee_send.py`. So a leaked outbox token buys an attacker disk space, not a
   message to a student.
 
-## Why the caller uploads, instead of the VPS pulling from Drive
+## Two ways in, and why
 
-`gog` on the box is authenticated as a **different Google account**
-(`kaandn51@gmail.com`) holding the **`drive.file`** scope — it only sees files
-it uploaded itself. The mentee reports are filed by the Cowork Drive connector
-under the user's own account, so the VPS genuinely cannot read them.
+The box's `gog` credential holds the **`drive.file`** scope, which grants access
+to exactly the files that credential uploaded — not to the Drive as a whole.
+Measured, not assumed:
 
-Making it able to would mean re-authorising with something like
-`drive.readonly`: server-side read access to the entire Drive, granted for one
-narrow feature. Having the caller post the bytes needs no new Google scope and
-works identically from Cowork, a laptop, or a cloud routine.
+| File | `gog drive download` |
+|---|---|
+| `Pinar_Turan_Aday_Brifingi` (VPS pipeline output) | 92 565 bytes |
+| Görüşme özeti PDF (VPS pipeline output) | 131 024 bytes |
+| A PDF added to Drive by hand | `404 notFound` |
+
+So the pipeline's own output — reports, meeting summaries, aday brifingi — is
+already reachable server-side. `stage_from_drive(file_id)` uses that: one MCP
+call, no upload, no outbox token, and the bytes never travel through the client.
+
+Everything else needs the caller to post the bytes. Widening the scope to
+`drive.readonly` would fix that too, but it buys server-side read access to the
+entire Drive for one narrow feature — not a trade worth making when uploading
+needs no Google permission at all.
 
 ## Endpoints
 
@@ -51,6 +60,22 @@ title from the staged file's name, so upload under the name they should read —
 `Ada — Danışmanlık Raporu.pdf`, not `output.pdf`. Directory parts, control
 characters and leading dots are stripped; the name is otherwise preserved,
 Turkish characters included.
+
+## Staging from Drive
+
+```
+stage_from_drive(file_id, filename="") -> {success, handle, filename, bytes}
+```
+
+Reads the Drive metadata first (rejecting a non-PDF mimeType or an oversized
+file before downloading), stages under the file's own Drive name unless
+`filename` overrides it, then re-checks the downloaded bytes for the `%PDF-`
+signature — Drive's mimeType is a label the uploader chose, and this file is
+about to go to a student. A file outside the credential's reach comes back as
+*"file not visible to this server"*, which is the signal to upload instead.
+
+Needs `GOG_ACCOUNT` and `GOG_KEYRING_PASSWORD` in the MCP service's `.env`
+(the file keyring cannot prompt in a service).
 
 ## Sending
 

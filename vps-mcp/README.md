@@ -16,21 +16,21 @@ remote MCP connector. Read-only: all send/download tools are stripped at startup
 ## Deployment (VPS)
 > **Host moved 2026-08-11.** This no longer runs on the DigitalOcean `hermes-agent`
 > box (139.59.158.24) — every WhatsApp unit there is stopped and disabled. It now
-> runs on the AWS EC2 instance **`ingest-box`** (`i-0ef0a3161202cf418`,
-> eu-central-1, 3.79.227.197), which is where `ingest.globalmentorluk.com`
+> runs on the AWS EC2 instance **`ingest-box`** (`i-xxxxxxxxxxxxxxxxx`,
+> eu-central-1, <ingest-box-ip>), which is where `ingest.globalmentorluk.com`
 > resolves. SSM is not connected on that instance; reach it over plain SSH:
-> `ssh -i ~/.ssh/dora_aws root@3.79.227.197`.
+> `ssh -i ~/.ssh/dora_aws root@<ingest-box-ip>`.
 >
 > **Port 22 is allow-listed per source IP** on security group `ingest-box`
-> (`sg-0e11a456779314049`, eu-central-1). A home-ISP address change makes SSH
+> (`sg-xxxxxxxxxxxxxxxxx`, eu-central-1). A home-ISP address change makes SSH
 > time out with no other symptom -- the box is fine, you are simply not on the
 > list. Check the current rules, then re-add yourself:
 >
 > ```bash
-> aws ec2 describe-security-groups --group-ids sg-0e11a456779314049 \
+> aws ec2 describe-security-groups --group-ids sg-xxxxxxxxxxxxxxxxx \
 >   --region eu-central-1 --query 'SecurityGroups[].IpPermissions' --output json
 > aws ec2 authorize-security-group-ingress --region eu-central-1 \
->   --group-id sg-0e11a456779314049 --ip-permissions \
+>   --group-id sg-xxxxxxxxxxxxxxxxx --ip-permissions \
 >   "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=$(curl -s https://checkip.amazonaws.com | tr -d '\n')/32,Description=kaan-home}]"
 > ```
 
