@@ -38,7 +38,7 @@ check_bridge() {
   # 1) service down?
   if ! systemctl is-active --quiet "$svc"; then
     if [ ! -f "$STATE/down_$svc" ]; then
-      notify "⚠️ WhatsApp $label: '$svc' servisi DÜŞTÜ (hermes-agent VPS)."
+      notify "⚠️ WhatsApp $label: '$svc' servisi DÜŞTÜ (ingest-box)."
       touch "$STATE/down_$svc"
     fi
     return
@@ -73,6 +73,33 @@ VPS'te (SSH):
     fi
   fi
   echo "$size" > "$off_file"
+
+  # 3) stuck disconnected — the process stays "active" but whatsmeow gave up.
+  # On 2026-10-26 both bridges hit "Client outdated (405)" and never retried;
+  # systemd kept saying active and no logout/QR line was printed, so checks 1
+  # and 2 stayed silent for hours. Judge by the LAST connection event in the
+  # log, and only alert if it stays bad for DISCONNECT_GRACE seconds (normal
+  # 503/EOF blips reconnect within seconds and never match these patterns).
+  local last since now
+  last=$(tail -c 2000000 "$logf" | grep -aE "Connected to WhatsApp|Client outdated|connect failure|Not connected to WhatsApp" | tail -1)
+  now=$(date +%s)
+  if [ -n "$last" ] && ! grep -q "Connected to WhatsApp" <<<"$last"; then
+    [ -f "$STATE/disc_since_$svc" ] || echo "$now" > "$STATE/disc_since_$svc"
+    since=$(cat "$STATE/disc_since_$svc")
+    if [ $((now - since)) -ge "${DISCONNECT_GRACE:-600}" ] && [ ! -f "$STATE/disc_alert_$svc" ]; then
+      local hint="systemctl restart $svc ile dene."
+      grep -q "Client outdated" <<<"$last" && hint="WhatsApp istemciyi eski buluyor (405): whatsmeow güncellenip bridge yeniden derlenmeli."
+      notify "🔴 WhatsApp $label BAĞLI DEĞİL — servis ayakta ama WhatsApp'a bağlanamıyor.
+Son satır: $(sed 's/\x1b\[[0-9;]*m//g' <<<"$last" | cut -c1-200)
+$hint"
+      touch "$STATE/disc_alert_$svc"
+    fi
+  else
+    if [ -f "$STATE/disc_alert_$svc" ]; then
+      notify "✅ WhatsApp $label yeniden bağlandı."
+    fi
+    rm -f "$STATE/disc_since_$svc" "$STATE/disc_alert_$svc"
+  fi
 }
 
 check_bridge whatsapp-bridge  "ana hesap (main)"      /var/log/whatsapp-bridge.log  /root/whatsapp/bridge
