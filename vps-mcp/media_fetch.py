@@ -13,10 +13,11 @@ decrypt with the stored media key -- the same scheme whatsmeow uses -- and check
 the plaintext SHA256 the bridge recorded, so a wrong or corrupted file cannot be
 served.
 
-Limits of this path, measured 2026-10-27: WhatsApp's CDN keeps media for roughly
-a month. Older attachments answer 403 (URL signature expired) or 410 (deleted);
-those come back as `media_gone`. Recovering them would need a re-upload request
-to the phone (whatsmeow media retry), which lives in the bridge.
+WhatsApp's CDN keeps media for roughly a month; older attachments answer 403
+(URL signature expired) or 410 (deleted). Then we ask the bridge's
+/api/media_retry to have the phone upload the file again -- what WhatsApp
+Desktop does -- and download from the new URL. `media_gone` means the phone
+could not help either (file deleted there, or phone offline).
 
 Tokens are deliberately STATEFUL (in-process dict), unlike the stateless OAuth
 tokens in serve_http.py: single-use cannot be enforced by a signature alone. A
@@ -163,6 +164,32 @@ def _fetch(url: str, logged_in: bool) -> bytes:
         return bytes(buf)
 
 
+# Bridge media-retry answer code -> (our error code, detail).
+_RETRY_ERRORS = {
+    "not_on_phone": ("media_gone", "Medya WhatsApp sunucusunda artık yok ve telefonda da bulunamadı."),
+    "phone_timeout": ("media_gone", "Medya WhatsApp sunucusunda artık yok; telefondan yeniden yükleme "
+                                    "istendi ama telefon cevap vermedi (çevrimdışı olabilir). Sonra tekrar dene."),
+    "not_logged_in": ("qr_required", "Medya sunucuda yok ve WhatsApp oturumu düşmüş: QR ile yeniden bağlanmak gerekiyor."),
+}
+
+
+def _phone_retry(api_base: str, message_id: str, chat_jid: str) -> str:
+    """Ask the phone to re-upload an expired attachment (bridge /api/media_retry); return the new URL."""
+    try:
+        resp = requests.post(f"{api_base}/media_retry", json={"message_id": message_id, "chat_jid": chat_jid},
+                             timeout=60)
+        result = resp.json()
+    except (requests.RequestException, ValueError) as exc:
+        raise MediaError("media_gone", f"Medya sunucuda yok; telefondan yeniden yükleme isteği başarısız: {exc}")
+    if result.get("success") and result.get("url"):
+        return result["url"]
+    code, detail = _RETRY_ERRORS.get(
+        result.get("code"),
+        ("media_gone", f"Medya sunucuda yok; telefondan yeniden yükleme başarısız: {result.get('message')}"),
+    )
+    raise MediaError(code, detail)
+
+
 def _transcribe(data: bytes, filename: str) -> str:
     key = _groq_key()
     if not key:
@@ -206,7 +233,7 @@ def _download(message_id: str, chat_jid: str, account: str, transcribe: bool) ->
         raise MediaError("bad_request", f"account 'main' ya da 'second' olmalı, '{account}' geldi.")
     if not _ID_RE.match(message_id or "") or not _JID_RE.match(chat_jid or ""):
         raise MediaError("bad_request", "message_id ya da chat_jid biçimi geçersiz.")
-    db_path, _ = _resolve(account)
+    db_path, api_base = _resolve(account)
 
     row = _load_row(db_path, message_id, chat_jid)
     if not row:
@@ -221,7 +248,14 @@ def _download(message_id: str, chat_jid: str, account: str, transcribe: bool) ->
     if not url or not media_key:
         raise MediaError("incomplete_media_info", "Bridge bu mesajın indirme bilgisini kaydetmemiş.")
 
-    plain = _decrypt(_fetch(url, _session_logged_in(db_path)), media_key, media_type, sha, enc_sha)
+    try:
+        enc = _fetch(url, _session_logged_in(db_path))
+    except MediaError as exc:
+        if exc.code != "media_gone":
+            raise
+        # Older than the CDN keeps it: have the phone upload it again, then retry once.
+        enc = _fetch(_phone_retry(api_base, message_id, chat_jid), True)
+    plain = _decrypt(enc, media_key, media_type, sha, enc_sha)
     if len(plain) > MAX_BYTES:
         raise MediaError("too_large", "Dosya 25 MB sınırını aşıyor.")
 
@@ -267,7 +301,8 @@ async def download_media(message_id: str, chat_jid: str, account: str = "main",
     transcribe=False.
 
     On failure returns {"ok": false, "error": <code>, "detail": <text>}:
-      media_gone   — WhatsApp deleted the file from its server (older than ~1 month)
+      media_gone   — gone from WhatsApp's server and the phone could not re-upload it
+                     (old files are re-requested from the phone automatically; can take ~45 s)
       qr_required  — the WhatsApp session dropped; re-link by QR
       too_large    — over 25 MB
       not_found / not_media / incomplete_media_info / integrity_error / cdn_error / bad_request

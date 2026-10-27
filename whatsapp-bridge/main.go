@@ -884,6 +884,9 @@ func main() {
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
 
+		case *events.MediaRetry:
+			deliverMediaRetry(v)
+
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
 
@@ -950,6 +953,7 @@ func main() {
 	if p := os.Getenv("WHATSAPP_BRIDGE_PORT"); p != "" {
 		fmt.Sscanf(p, "%d", &port)
 	}
+	registerMediaRetryHandler(client, messageStore)
 	startRESTServer(client, messageStore, port)
 
 	// Create a channel to keep the main goroutine alive

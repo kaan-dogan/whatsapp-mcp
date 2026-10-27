@@ -155,10 +155,11 @@ The bridge's own `/api/download` is not used: it strips the `oh`/`oe` signature
 from the CDN path, so it answers 403 for every file, even one sent yesterday.
 
 **What can be downloaded:** WhatsApp keeps media on its CDN for about a month.
-Older files return `media_gone` (403 = signature expired, 410 = deleted). Measured
-2026-10-27: a 26 Oct PDF downloaded and verified; Ada's 31 Aug PDFs (403) and the
-29 Sep summary (410) did not. Recovering old media needs whatsmeow's media-retry
-(the phone re-uploads), which has to be built into the bridge.
+Older files answer 403 (signature expired) or 410 (deleted). Then `download_media`
+calls the bridge's `/api/media_retry` (`whatsapp-bridge/mediaretry.go`): the bridge
+sends a media-retry receipt to our own phone, the phone uploads the file again (what
+WhatsApp Desktop does), and the bridge stores the new CDN URL. This takes up to ~45 s
+and needs the phone online with the file still on it; otherwise `media_gone`.
 
 Errors: `media_gone` · `qr_required` (CDN refused **and** `whatsmeow_device` is
 empty) · `too_large` · `not_found` · `not_media` · `incomplete_media_info` ·
