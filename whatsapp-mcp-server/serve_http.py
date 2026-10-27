@@ -98,6 +98,9 @@ print("read-only MCP tools:", sorted(main.mcp._tool_manager._tools.keys()), flus
 # --- allowlisted send: one narrow write tool, group JIDs from allowlist.json ---
 import mentee_send  # registers send_to_mentee_group + list_mentee_groups
 
+# --- read-only media download: download_media + one-shot /mcp/media/<token> URL ---
+import media_fetch
+
 # --- compat shim: upstream tools return dataclasses; mcp>=1.10 wants dicts ---
 import dataclasses
 import inspect
@@ -377,7 +380,8 @@ async def token(request: Request):
 # Auth gate for /mcp (OAuth access token OR static bearer); public OAuth paths
 # pass straight through.
 # ---------------------------------------------------------------------------
-_PUBLIC_PREFIXES = ("/.well-known/",)
+# /mcp/media/<token>: the single-use token in the path IS the credential (curl, no header).
+_PUBLIC_PREFIXES = ("/.well-known/", media_fetch.MEDIA_PREFIX)
 _PUBLIC_EXACT = {"/register", "/authorize", "/token"}
 
 
@@ -419,6 +423,7 @@ mcp_app.router.routes[0:0] = [
     Route("/register", register, methods=["POST"]),
     Route("/authorize", authorize, methods=["GET", "POST"]),
     Route("/token", token, methods=["POST"]),
+    Route(media_fetch.MEDIA_ROUTE, media_fetch.serve_media, methods=["GET"]),
 ]
 
 app = AuthGate(mcp_app)

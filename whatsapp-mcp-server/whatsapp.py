@@ -5,6 +5,7 @@ from typing import Optional, List, Tuple
 import os.path
 import requests
 import json
+import mimetypes
 import audio
 
 # --- Multi-account support -------------------------------------------------
@@ -255,6 +256,8 @@ class Message:
     id: str
     chat_name: Optional[str] = None
     media_type: Optional[str] = None
+    filename: Optional[str] = None
+    file_length: Optional[int] = None
 
 @dataclass
 class Chat:
@@ -331,6 +334,38 @@ def get_sender_name(sender_jid: str, db_path: str) -> str:
         if 'conn' in locals():
             conn.close()
 
+# The bridge stores no mimetype, so it is derived from the filename it kept.
+# Voice notes are always Opus-in-Ogg; the bridge names every audio file *.ogg.
+_MEDIA_DEFAULT_MIME = {
+    "image": "image/jpeg",
+    "video": "video/mp4",
+    "audio": "audio/ogg",
+    "document": "application/octet-stream",
+}
+
+
+def guess_mimetype(media_type: Optional[str], filename: Optional[str]) -> str:
+    if media_type == "audio":
+        return "audio/ogg"
+    guessed = mimetypes.guess_type(filename or "")[0]
+    return guessed or _MEDIA_DEFAULT_MIME.get(media_type or "", "application/octet-stream")
+
+
+def human_size(n: Optional[int]) -> str:
+    if not n:
+        return "?"
+    for unit in ("B", "KB", "MB"):
+        if n < 1024 or unit == "MB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def media_meta_tag(media_type: Optional[str], filename: Optional[str], file_length: Optional[int]) -> str:
+    """`[filename: X | mimetype: Y | size: Z]` -- enough to say "they sent this" without downloading."""
+    return (f"[filename: {filename or '?'} | mimetype: {guess_mimetype(media_type, filename)}"
+            f" | size: {human_size(file_length)}{f' ({file_length} bytes)' if file_length else ''}] ")
+
+
 def format_message(message: Message, show_chat_info: bool = True, db_path: Optional[str] = None) -> None:
     """Print a single message with consistent formatting."""
     output = ""
@@ -345,7 +380,11 @@ def format_message(message: Message, show_chat_info: bool = True, db_path: Optio
 
     content_prefix = ""
     if hasattr(message, 'media_type') and message.media_type:
+        # Keep the first bracket byte-identical: routines parse it for the IDs.
         content_prefix = f"[{message.media_type} - Message ID: {message.id} - Chat JID: {message.chat_jid}] "
+        content_prefix += media_meta_tag(message.media_type, message.filename, message.file_length)
+        if message.content:
+            content_prefix += "caption: "
 
     try:
         sender_name = get_sender_name(message.sender, db_path) if not message.is_from_me else "Me"
@@ -384,7 +423,7 @@ def list_messages(
         cursor = conn.cursor()
 
         # Build base query
-        query_parts = ["SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type FROM messages"]
+        query_parts = ["SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.filename, messages.file_length FROM messages"]
         query_parts.append("JOIN chats ON messages.chat_jid = chats.jid")
         where_clauses = []
         params = []
@@ -442,7 +481,9 @@ def list_messages(
                 is_from_me=msg[4],
                 chat_jid=msg[5],
                 id=msg[6],
-                media_type=msg[7]
+                media_type=msg[7],
+                filename=msg[8],
+                file_length=msg[9]
             )
             result.append(message)
 
@@ -482,7 +523,7 @@ def get_message_context(
 
         # Get the target message first
         cursor.execute("""
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type
+            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type, messages.filename, messages.file_length
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.id = ?
@@ -500,12 +541,14 @@ def get_message_context(
             is_from_me=msg_data[4],
             chat_jid=msg_data[5],
             id=msg_data[6],
-            media_type=msg_data[8]
+            media_type=msg_data[8],
+            filename=msg_data[9],
+            file_length=msg_data[10]
         )
 
         # Get messages before
         cursor.execute("""
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type
+            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.filename, messages.file_length
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.chat_jid = ? AND messages.timestamp < ?
@@ -523,12 +566,14 @@ def get_message_context(
                 is_from_me=msg[4],
                 chat_jid=msg[5],
                 id=msg[6],
-                media_type=msg[7]
+                media_type=msg[7],
+                filename=msg[8],
+                file_length=msg[9]
             ))
 
         # Get messages after
         cursor.execute("""
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type
+            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.filename, messages.file_length
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.chat_jid = ? AND messages.timestamp > ?
@@ -546,7 +591,9 @@ def get_message_context(
                 is_from_me=msg[4],
                 chat_jid=msg[5],
                 id=msg[6],
-                media_type=msg[7]
+                media_type=msg[7],
+                filename=msg[8],
+                file_length=msg[9]
             ))
 
         return MessageContext(
@@ -778,7 +825,9 @@ def get_last_interaction(jid: str, account: Optional[str] = None) -> str:
                 m.is_from_me,
                 c.jid,
                 m.id,
-                m.media_type
+                m.media_type,
+                m.filename,
+                m.file_length
             FROM messages m
             JOIN chats c ON m.chat_jid = c.jid
             WHERE m.sender = ? OR c.jid = ?
@@ -799,7 +848,9 @@ def get_last_interaction(jid: str, account: Optional[str] = None) -> str:
             is_from_me=msg_data[4],
             chat_jid=msg_data[5],
             id=msg_data[6],
-            media_type=msg_data[7]
+            media_type=msg_data[7],
+            filename=msg_data[8],
+            file_length=msg_data[9]
         )
 
         return format_message(message, db_path=db_path)

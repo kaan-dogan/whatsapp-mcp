@@ -133,3 +133,37 @@ Two things now prevent a silent repeat:
 
 Deploying the fix means copying `whatsapp.py` **and** `selfcheck.py`, then
 restarting `whatsapp-mcp.service`.
+
+## Reading attachments: `download_media` (2026-10-27)
+
+`list_messages` now prints `[filename: … | mimetype: … | size: …]` after the
+unchanged `[<type> - Message ID: … - Chat JID: …]` bracket, so "they sent X" needs
+no download. The mimetype is derived from the filename: the bridge stores none.
+Captions are not stored by the bridge either (`extractTextContent` ignores them),
+so they only appear once the bridge is changed to keep them.
+
+`download_media(message_id, chat_jid, account, transcribe=True)` (`media_fetch.py`)
+fetches the attachment straight from WhatsApp's CDN using the URL and media key the
+bridge recorded, decrypts it, and checks the plaintext SHA256 against the bridge's
+record. It returns `filename`, `mimetype`, `size_bytes` and a **single-use, 10-minute**
+URL under `/mcp/media/<token>` (public path; the 256-bit token is the credential,
+no Caddy change since it sits under `/mcp*`). File bytes never enter the MCP reply.
+Voice notes also return a Groq `transcript`; the key is read from
+`/root/meeting-ingest/.env` so it lives in one place. Cap: 25 MB.
+
+The bridge's own `/api/download` is not used: it strips the `oh`/`oe` signature
+from the CDN path, so it answers 403 for every file, even one sent yesterday.
+
+**What can be downloaded:** WhatsApp keeps media on its CDN for about a month.
+Older files return `media_gone` (403 = signature expired, 410 = deleted). Measured
+2026-10-27: a 26 Oct PDF downloaded and verified; Ada's 31 Aug PDFs (403) and the
+29 Sep summary (410) did not. Recovering old media needs whatsmeow's media-retry
+(the phone re-uploads), which has to be built into the bridge.
+
+Errors: `media_gone` · `qr_required` (CDN refused **and** `whatsmeow_device` is
+empty) · `too_large` · `not_found` · `not_media` · `incomplete_media_info` ·
+`integrity_error` · `cdn_error` · `bad_request`.
+
+Deploy: copy `whatsapp.py`, `serve_http.py` (from `whatsapp-mcp-server/`) and
+`media_fetch.py` to `/root/whatsapp/mcp/`, restart `whatsapp-mcp`, then reconnect
+the claude.ai connector (its tool list is cached).
