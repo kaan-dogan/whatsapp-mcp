@@ -60,6 +60,10 @@ REDIRECT_ALLOWLIST = {
     "https://claude.com/api/mcp/auth_callback",
     # ChatGPT's legacy connector callback (still used by published apps).
     "https://chatgpt.com/connector_platform_oauth_redirect",
+    # Grok (grok.com web) custom connector callback, observed 2026. An older
+    # path was also reported; both are exact strings, not a grok.com wildcard.
+    "https://grok.com/connectors-oauth-exchange-code/",
+    "https://grok.com/connectors/oauth/callback",
 }
 # ChatGPT mints a FRESH callback path per connector
 # (https://chatgpt.com/connector/oauth/<callback_id>), so it can never match an
