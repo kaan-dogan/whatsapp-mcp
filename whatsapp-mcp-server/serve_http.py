@@ -64,6 +64,10 @@ REDIRECT_ALLOWLIST = {
     # path was also reported; both are exact strings, not a grok.com wildcard.
     "https://grok.com/connectors-oauth-exchange-code/",
     "https://grok.com/connectors/oauth/callback",
+    # Grok Bot runs on Cursor's agent platform and uses Cursor's callback
+    # (seen in our own log 2026-11-17).
+    "https://www.cursor.com/agents/mcp/oauth/callback",
+    "https://cursor.com/agents/mcp/oauth/callback",
 }
 # ChatGPT mints a FRESH callback path per connector
 # (https://chatgpt.com/connector/oauth/<callback_id>), so it can never match an
